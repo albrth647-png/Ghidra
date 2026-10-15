@@ -13,6 +13,11 @@ jobs:
 
     steps:
       # ---------------------------------------------------------------
+      # 0. Sin checkout el workspace esta vacio
+      # ---------------------------------------------------------------
+      - uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
       # 1. Objetivo propio: lo compilamos aqui, sin subir binarios
       # ---------------------------------------------------------------
       - name: Compilar el objetivo de prueba
