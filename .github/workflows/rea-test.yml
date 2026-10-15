@@ -1,0 +1,128 @@
+# Pipeline de verificación: REA + Ghidra 12.1.4 en GitHub Actions.
+# Objetivo 1: comprobar que el motor nativo funciona de extremo a extremo.
+# Objetivo 2: comprobar que el coste en repo público es 0,00 $.
+name: REA-Ghidra-Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analizar:
+    runs-on: ubuntu-latest      # x86_64 -> trae el decompiler linux_x86_64 oficial
+    timeout-minutes: 60         # limite duro de Actions: 6 h
+
+    steps:
+      # ---------------------------------------------------------------
+      # 1. Objetivo propio: lo compilamos aqui, sin subir binarios
+      # ---------------------------------------------------------------
+      - name: Compilar el objetivo de prueba
+        run: |
+          mkdir -p "$RUNNER_TEMP/obj"
+          gcc -O0 -g -o "$RUNNER_TEMP/obj/hola" "$GITHUB_WORKSPACE/test/hola.c"
+          echo "--- identidad del objetivo ---"
+          file "$RUNNER_TEMP/obj/hola"
+          sha256sum "$RUNNER_TEMP/obj/hola"
+
+      # ---------------------------------------------------------------
+      # 2. Requisitos de REA
+      # ---------------------------------------------------------------
+      - name: Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: JDK 21 (Ghidra 12.1.x lo exige)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: procps (REA se niega a arrancar sin un ps compatible)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends procps
+
+      # ---------------------------------------------------------------
+      # 3. Ghidra 12.1.4 — descarga verificada por SHA-256
+      # ---------------------------------------------------------------
+      - name: Cachear Ghidra
+        uses: actions/cache@v4
+        with:
+          path: ~/ghidra
+          key: ghidra-12.1.4-ddac49f9
+
+      - name: Instalar Ghidra 12.1.4
+        run: |
+          if [ ! -d "$HOME/ghidra" ]; then
+            curl -fsSL -o "$RUNNER_TEMP/ghidra.zip" \
+              "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip"
+
+            echo "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db  $RUNNER_TEMP/ghidra.zip" \
+              | sha256sum -c -
+
+            unzip -q "$RUNNER_TEMP/ghidra.zip" -d "$HOME"
+            mv "$HOME"/ghidra_12.1.4_PUBLIC "$HOME/ghidra"
+            rm -f "$RUNNER_TEMP/ghidra.zip"
+          fi
+          echo "Ghidra instalado en $HOME/ghidra"
+          "$HOME/ghidra/support/analyzeHeadless" 2>&1 | head -3 || true
+
+      # ---------------------------------------------------------------
+      # 4. REA
+      # ---------------------------------------------------------------
+      - name: Instalar REA
+        run: npm install -g rea-agents --no-audit --no-fund
+
+      - name: Verificar que REA acepta Ghidra
+        env:
+          GHIDRA_INSTALL_DIR: /home/runner/ghidra
+        run: |
+          set -o pipefail
+          rea doctor --provider ghidra --json | tee "$RUNNER_TEMP/doctor.json"
+          echo "--- verdicto ---"
+          python3 -c "
+          import json
+          d = json.load(open('$RUNNER_TEMP/doctor.json'))
+          print('healthy:', d.get('healthy'))
+          print('scope:', json.dumps(d.get('scope', {}))[:300])
+          "
+
+      # ---------------------------------------------------------------
+      # 5. Analizar
+      # ---------------------------------------------------------------
+      - name: Analizar con REA + Ghidra
+        env:
+          GHIDRA_INSTALL_DIR: /home/runner/ghidra
+          REA_GHIDRA_STARTUP_TIMEOUT_MS: '1200000'
+        run: |
+          set -o pipefail
+          rea analyze "$RUNNER_TEMP/obj/hola" --provider ghidra --json > "$RUNNER_TEMP/evidencia.json"
+          echo "--- tamaño de la Evidence ---"
+          wc -c "$RUNNER_TEMP/evidencia.json"
+
+      - name: Resumen de la Evidence
+        run: |
+          python3 -c "
+          import json
+          d = json.load(open('$RUNNER_TEMP/evidencia.json'))
+          print('evidence_id :', d.get('evidence_id'))
+          print('operacion   :', d.get('operation'))
+          print('confianza   :', d.get('confidence'))
+          print('autoridad   :', d.get('authority'))
+          print('limitaciones:', len(d.get('limitations', [])))
+          for lim in d.get('limitations', [])[:5]:
+              print('   -', lim[:120])
+          nr = d.get('normalized_result') or {}
+          if isinstance(nr, dict):
+              print('resultado   :', list(nr.keys())[:12])
+          "
+
+      # ---------------------------------------------------------------
+      # 6. Subir resultado
+      # ---------------------------------------------------------------
+      - name: Subir Evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rea-evidencia
+          path: ${{ runner.temp }}/evidencia.json
+          retention-days: 7
+          if-no-files-found: warn

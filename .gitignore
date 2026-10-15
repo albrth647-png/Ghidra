@@ -1,0 +1,10 @@
+# Nunca subir credenciales a este repo.
+token
+*.token
+.env
+.env.*
+*.pem
+*.key
+secrets/
+.git-credentials
+.netrc
