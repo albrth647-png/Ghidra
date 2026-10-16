@@ -27,6 +27,16 @@ on:
         required: false
         default: ""
         type: string
+      analizar_nativo:
+        description: "¿Ejecutar Ghidra sobre el binario nativo? (true/false)"
+        required: false
+        default: "true"
+        type: string
+      analizar_asar_completo:
+        description: "true = analizar todo el asar (inventario amplio) · false = solo proceso main (vectores Electron)"
+        required: false
+        default: "false"
+        type: string
 
 jobs:
   auditar:
@@ -161,13 +171,69 @@ jobs:
           find . -type f -perm -u+x -size +1M 2>/dev/null | head -10
 
       # ---------------------------------------------------------------
+      # 5b. Extraer asar → package.json (deps con versión) + SBOM + main
+      # ---------------------------------------------------------------
+      - name: Extraer asar (SBOM + proceso main)
+        run: |
+          set -uo pipefail
+          ASAR=$(find "$RUNNER_TEMP/extraido" -name "*.asar" 2>/dev/null | head -1)
+          if [ -z "$ASAR" ]; then
+            echo "No hay asar — se conserva la estrategia de descubrimiento genérico."
+            echo "asar_extraido=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "asar: $ASAR"
+          npx --yes @electron/asar extract "$ASAR" "$RUNNER_TEMP/asar_x" >/dev/null 2>&1 || {
+            echo "No se pudo extraer el asar (se analiza tal cual)."
+            echo "asar_extraido=false" >> "$GITHUB_ENV"; exit 0;
+          }
+          echo "asar_extraido=true" >> "$GITHUB_ENV"
+
+          # --- package.json del proyecto (nombre, versión, main, deps) ---
+          if [ -f "$RUNNER_TEMP/asar_x/package.json" ]; then
+            cp "$RUNNER_TEMP/asar_x/package.json" "$RUNNER_TEMP/package-proyecto.json"
+            echo "--- package.json del proyecto ---"
+            jq -r '"app: \(.name)@\(.version)  main: \(.main // "n/d")"' "$RUNNER_TEMP/package-proyecto.json" || true
+            echo "deps directas: $(jq '(.dependencies // {}) | length' "$RUNNER_TEMP/package-proyecto.json" 2>/dev/null || echo 0)"
+            echo "devDeps: $(jq '(.devDependencies // {}) | length' "$RUNNER_TEMP/package-proyecto.json" 2>/dev/null || echo 0)"
+          fi
+
+          # --- SBOM: name@version de cada manifiesto node_modules empaquetado ---
+          (
+            cd "$RUNNER_TEMP/asar_x" || exit 0
+            find node_modules -maxdepth 5 -name package.json -type f 2>/dev/null | while read -r f; do
+              n=$(jq -r '.name // empty' "$f" 2>/dev/null)
+              v=$(jq -r '.version // empty' "$f" 2>/dev/null)
+              [ -n "$n" ] && echo "$n@$v"
+            done | sort -u > "$RUNNER_TEMP/sbom.txt"
+          ) || true
+          echo "SBOM: $(wc -l < "$RUNNER_TEMP/sbom.txt" 2>/dev/null || echo 0) paquetes con versión"
+          head -15 "$RUNNER_TEMP/sbom.txt" 2>/dev/null || true
+
+          # --- objetivo JS: dir del entrypoint main (proceso main, sin bundles) ---
+          if [ "${{ inputs.analizar_asar_completo }}" != "true" ]; then
+            MAIN=$(jq -r '.main // empty' "$RUNNER_TEMP/asar_x/package.json" 2>/dev/null | sed 's|^\./||')
+            if [ -n "$MAIN" ] && [ -f "$RUNNER_TEMP/asar_x/$MAIN" ]; then
+              D=$(dirname "$MAIN")
+              echo "js_target_override=$RUNNER_TEMP/asar_x/$D" >> "$GITHUB_ENV"
+              echo "entrypoint main: $MAIN → objetivo: asar_x/$D"
+            else
+              echo "No se resolvió el main (se usará el asar completo o el descubrimiento)."
+              jq -r '.main // "SIN CAMPO main"' "$RUNNER_TEMP/asar_x/package.json" 2>/dev/null || true
+            fi
+          fi
+
+      # ---------------------------------------------------------------
       # 6. Análisis JS/Electron  ← ESTA ES LA OFERTA DE 150 USDT
       # ---------------------------------------------------------------
       - name: Análisis JS/Electron con REA
         run: |
           set -euo pipefail
-          # elegir objetivo: asar > dir con package.json > raíz extraída
-          TARGET=$(find "$RUNNER_TEMP/extraido" -name "*.asar" 2>/dev/null | head -1)
+          # elegir objetivo: override (proceso main) > asar > dir con package.json > raíz
+          TARGET="${js_target_override:-}"
+          if [ -z "$TARGET" ]; then
+            TARGET=$(find "$RUNNER_TEMP/extraido" -name "*.asar" 2>/dev/null | head -1)
+          fi
           if [ -z "$TARGET" ]; then
             TARGET=$(find "$RUNNER_TEMP/extraido" -name "package.json" -not -path "*/node_modules/*" 2>/dev/null | head -1 | xargs -r dirname)
           fi
@@ -207,8 +273,14 @@ jobs:
         env:
           GHIDRA_INSTALL_DIR: /home/runner/ghidra
           REA_GHIDRA_STARTUP_TIMEOUT_MS: '1200000'
+          ANALIZAR_NATIVO: ${{ inputs.analizar_nativo }}
         run: |
           set -uo pipefail
+          if [ "${ANALIZAR_NATIVO:-true}" != "true" ]; then
+            echo "Ghidra omitido por input (analizar_nativo=false) — ya existe evidencia nativa de un run previo."
+            echo "ghidra_omitido=input_false" >> "$GITHUB_ENV"
+            exit 0
+          fi
           BIN=$(find "$RUNNER_TEMP/extraido" -type f -perm -u+x -size +1M 2>/dev/null | head -1)
           if [ -z "$BIN" ]; then
             echo "No se encontró binario nativo — se omite Ghidra."
@@ -263,6 +335,8 @@ jobs:
             ${{ runner.temp }}/evidencia-js.json
             ${{ runner.temp }}/evidencia-nativa.json
             ${{ runner.temp }}/resumen-auditoria.json
+            ${{ runner.temp }}/sbom.txt
+            ${{ runner.temp }}/package-proyecto.json
             ${{ runner.temp }}/app/asset.sha256
           retention-days: 14
           if-no-files-found: warn
