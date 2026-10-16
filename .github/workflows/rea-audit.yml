@@ -1,0 +1,268 @@
+# Workflow de AUDITORÍA: descarga una app desde una release de GitHub,
+# la analiza con REA (JS/Electron) + Ghidra (nativo) y sube solo la evidencia.
+#
+# Diseñado para la Fase 0 del PLAN-EJECUCION: el pesado ocurre en la nube,
+# el móvil solo empuja este workflow y baja unos KB de evidencia.
+#
+# USO:
+#   Actions -> REA-Audit -> Run workflow
+#     app_nombre : drawio
+#     asset_url  : https://github.com/.../drawio-amd64-32.4.1.deb
+#     sha256_url : https://github.com/.../Files-SHA256-Hashes.txt   (opcional)
+name: REA-Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_nombre:
+        description: "Nombre corto de la app (ej: drawio)"
+        required: true
+        type: string
+      asset_url:
+        description: "URL completa del asset a descargar (release de GitHub)"
+        required: true
+        type: string
+      sha256_url:
+        description: "URL opcional del fichero de hashes oficiales (verificación)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  auditar:
+    runs-on: ubuntu-latest        # x86_64 -> decompiler Ghidra linux_x86_64 válido
+    timeout-minutes: 60
+
+    steps:
+      # ---------------------------------------------------------------
+      # 0. Checkout (sin esto el workspace está vacío)
+      # ---------------------------------------------------------------
+      - uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 1. Requisitos
+      # ---------------------------------------------------------------
+      - name: Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: JDK 21 (Ghidra 12.1.x lo exige)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: procps + herramientas de extracción
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends procps binutils xz-utils unzip
+
+      # ---------------------------------------------------------------
+      # 2. REA (cacheado)
+      # ---------------------------------------------------------------
+      - name: Cache npm (REA)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-rea-6.5.0
+
+      - name: Instalar REA
+        run: npm install -g rea-agents@6.5.0 --no-audit --no-fund
+
+      # ---------------------------------------------------------------
+      # 3. Ghidra 12.1.4 (descarga verificada por SHA-256)
+      # ---------------------------------------------------------------
+      - name: Cache Ghidra
+        uses: actions/cache@v4
+        with:
+          path: ~/ghidra
+          key: ghidra-12.1.4-ddac49f9
+
+      - name: Instalar Ghidra 12.1.4
+        run: |
+          if [ ! -d "$HOME/ghidra" ]; then
+            curl -fSL --retry 3 -o "$RUNNER_TEMP/ghidra.zip" \
+              "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip"
+            echo "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db  $RUNNER_TEMP/ghidra.zip" \
+              | sha256sum -c -
+            unzip -q "$RUNNER_TEMP/ghidra.zip" -d "$HOME"
+            mv "$HOME"/ghidra_12.1.4_PUBLIC "$HOME/ghidra"
+            rm -f "$RUNNER_TEMP/ghidra.zip"
+          fi
+          "$HOME/ghidra/support/analyzeHeadless" 2>&1 | head -2 || true
+
+      # ---------------------------------------------------------------
+      # 4. Descargar la app (EN LA NUBE — no gasta datos del móvil)
+      # ---------------------------------------------------------------
+      - name: Descargar y verificar el asset
+        env:
+          ASSET_URL: ${{ inputs.asset_url }}
+          SHA256_URL: ${{ inputs.sha256_url }}
+          APP: ${{ inputs.app_nombre }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/app" "$RUNNER_TEMP/extraido"
+          curl -fSL --retry 3 -A "rea-audit" -o "$RUNNER_TEMP/app/asset" "$ASSET_URL"
+
+          echo "--- identidad real del asset (por contenido, no por extensión) ---"
+          file "$RUNNER_TEMP/app/asset"
+          echo "--- sha256 del asset ---"
+          sha256sum "$RUNNER_TEMP/app/asset" | tee "$RUNNER_TEMP/app/asset.sha256"
+
+          if [ -n "${SHA256_URL:-}" ]; then
+            echo "--- verificando contra el hash oficial del proyecto ---"
+            curl -fSL --retry 3 -o "$RUNNER_TEMP/app/oficial.sha256" "$SHA256_URL" || true
+            if [ -s "$RUNNER_TEMP/app/oficial.sha256" ]; then
+              H=$(sha256sum "$RUNNER_TEMP/app/asset" | cut -d' ' -f1 | tr 'A-F' 'a-f')
+              if grep -qi "$H" "$RUNNER_TEMP/app/oficial.sha256"; then
+                echo "VERIFICADO: el hash coincide con el publicado por el proyecto"
+                echo "sha256_verificado=true" >> "$GITHUB_ENV"
+              else
+                echo "AVISO: el hash NO aparece en el fichero oficial"
+                echo "sha256_verificado=false" >> "$GITHUB_ENV"
+              fi
+            fi
+          else
+            echo "sha256_verificado=no_disponible" >> "$GITHUB_ENV"
+          fi
+
+      # ---------------------------------------------------------------
+      # 5. Extraer (soporta .deb, .zip, .tar.*, .asar plano)
+      # ---------------------------------------------------------------
+      - name: Extraer el paquete
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/extraido"
+          F="$RUNNER_TEMP/app/asset"
+          case "$(file -b "$F")" in
+            *Debian*|*"package"*|*compressed*)
+              if file -b "$F" | grep -qi debian; then
+                ar x "$F" 2>/dev/null || true
+                for d in data.tar.*; do
+                  [ -e "$d" ] && tar -xf "$d" && rm -f "$d"
+                done
+                rm -f control.tar.* debian-binary 2>/dev/null || true
+              elif unzip -t "$F" >/dev/null 2>&1; then
+                unzip -q "$F"
+              else
+                tar -xf "$F"
+              fi
+              ;;
+            *)
+              if unzip -t "$F" >/dev/null 2>&1; then unzip -q "$F"; else tar -xf "$F" || cp "$F" ./asset.bin; fi
+              ;;
+          esac
+          echo "--- estructura extraída (top) ---"
+          find . -maxdepth 3 -type d | head -30
+          echo "--- localizando app.asar / package.json ---"
+          find . \( -name "*.asar" -o -name "package.json" \) -not -path "*/node_modules/*" 2>/dev/null | head -20
+          echo "--- binarios nativos principales ---"
+          find . -type f -perm -u+x -size +1M 2>/dev/null | head -10
+
+      # ---------------------------------------------------------------
+      # 6. Análisis JS/Electron  ← ESTA ES LA OFERTA DE 150 USDT
+      # ---------------------------------------------------------------
+      - name: Análisis JS/Electron con REA
+        run: |
+          set -euo pipefail
+          # elegir objetivo: asar > dir con package.json > raíz extraída
+          TARGET=$(find "$RUNNER_TEMP/extraido" -name "*.asar" 2>/dev/null | head -1)
+          if [ -z "$TARGET" ]; then
+            TARGET=$(find "$RUNNER_TEMP/extraido" -name "package.json" -not -path "*/node_modules/*" 2>/dev/null | head -1 | xargs -r dirname)
+          fi
+          if [ -z "$TARGET" ]; then
+            TARGET="$RUNNER_TEMP/extraido"
+          fi
+          echo "objetivo JS: $TARGET"
+          if [ -f "$TARGET" ]; then
+            mkdir -p "$RUNNER_TEMP/jsdir" && cp "$TARGET" "$RUNNER_TEMP/jsdir/"
+            TARGET="$RUNNER_TEMP/jsdir/$(basename "$TARGET")"
+          fi
+
+          rea analyze-javascript-application "$TARGET" --json \
+            > "$RUNNER_TEMP/evidencia-js.json" || echo "js_exit=$?" >> "$GITHUB_ENV"
+
+          echo "--- tamaño evidencia JS ---"
+          wc -c "$RUNNER_TEMP/evidencia-js.json" 2>/dev/null || true
+          python3 -c "
+          import json,sys
+          try:
+              d=json.load(open('$RUNNER_TEMP/evidencia-js.json'))
+          except Exception as e:
+              print('no se pudo parsear:',e); sys.exit(0)
+          print('evidence_id:', d.get('evidence_id'))
+          print('operacion  :', d.get('operation'))
+          print('confianza  :', d.get('confidence'))
+          print('limitaciones:', len(d.get('limitations',[])))
+          nr=d.get('normalized_result') or {}
+          if isinstance(nr,dict):
+              print('claves:', list(nr.keys())[:20])
+          " || true
+
+      # ---------------------------------------------------------------
+      # 7. Análisis NATIVO con Ghidra (Cara 2 / bonus)
+      # ---------------------------------------------------------------
+      - name: Análisis nativo con Ghidra
+        env:
+          GHIDRA_INSTALL_DIR: /home/runner/ghidra
+          REA_GHIDRA_STARTUP_TIMEOUT_MS: '1200000'
+        run: |
+          set -uo pipefail
+          BIN=$(find "$RUNNER_TEMP/extraido" -type f -perm -u+x -size +1M 2>/dev/null | head -1)
+          if [ -z "$BIN" ]; then
+            echo "No se encontró binario nativo — se omite Ghidra."
+            echo "ghidra_omitido=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "binario nativo: $BIN"
+          file "$BIN"
+          sha256sum "$BIN"
+          rea analyze "$BIN" --provider ghidra --json \
+            > "$RUNNER_TEMP/evidencia-nativa.json" || echo "native_exit=$?" >> "$GITHUB_ENV"
+          echo "--- tamaño evidencia nativa ---"
+          wc -c "$RUNNER_TEMP/evidencia-nativa.json" 2>/dev/null || true
+
+      # ---------------------------------------------------------------
+      # 8. Resumen unificado
+      # ---------------------------------------------------------------
+      - name: Resumen de la auditoría
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          out = {"app": os.environ.get("APP",""), "archivos": {}, "sha256_verificado": os.environ.get("sha256_verificado","")}
+          tmp = pathlib.Path(os.environ["RUNNER_TEMP"])
+          for nombre in ("evidencia-js.json","evidencia-nativa.json"):
+              p = tmp / nombre
+              if not p.exists():
+                  out["archivos"][nombre] = "ausente"; continue
+              try:
+                  d = json.loads(p.read_text())
+                  out["archivos"][nombre] = {
+                      "evidence_id": d.get("evidence_id"),
+                      "operation": d.get("operation"),
+                      "confidence": d.get("confidence"),
+                      "limitaciones": len(d.get("limitations",[])),
+                      "bytes": p.stat().st_size,
+                  }
+              except Exception as e:
+                  out["archivos"][nombre] = f"error: {e}"
+          (tmp / "resumen-auditoria.json").write_text(json.dumps(out, indent=2, ensure_ascii=False))
+          print(json.dumps(out, indent=2, ensure_ascii=False))
+          PY
+
+      # ---------------------------------------------------------------
+      # 9. Subir evidencia (siempre, aunque algo falle)
+      # ---------------------------------------------------------------
+      - name: Subir evidencia
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rea-auditoria-${{ inputs.app_nombre }}
+          path: |
+            ${{ runner.temp }}/evidencia-js.json
+            ${{ runner.temp }}/evidencia-nativa.json
+            ${{ runner.temp }}/resumen-auditoria.json
+            ${{ runner.temp }}/app/asset.sha256
+          retention-days: 14
+          if-no-files-found: warn
