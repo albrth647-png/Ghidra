@@ -1,0 +1,191 @@
+# Workflow: REA-Connectors — analizar la capa de conectores de una web con REA.
+#
+# 🛡️ POR QUÉ EXISTE (2026-10-20): queremos saber, con EVIDENCIA y no con
+#   rumores, cómo conecta claude.ai con las redes sociales (y si hay un
+#   camino gratis). El método del proyecto: REA del objetivo -> endpoint real
+#   -> reimplementación propia. Este workflow es el "REA del objetivo".
+#
+#   · Todo el peso ocurre EN LA NUBE (runner público = minutos ilimitados, 0 $).
+#     El móvil solo empuja el workflow y baja unos KB de resumen.
+#   · NINGÚN SECRETO: no hay cookies, ni sesión, ni tokens. Solo páginas públicas.
+#     El artefacto solo contiene URLs/métodos/estado y tamaño de las transfers.
+#   · El netlog se parsea para extraer SOLO url + método + status + bytes.
+#     Nunca se extraen cabeceras, cookies ni cuerpos.
+#
+# USO: Actions -> REA-Connectors -> Run workflow
+#      url    : página a analizar (por defecto la portada de claude.ai)
+#      origin : origen exacto para el filtro de REA
+name: REA-Connectors
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL a analizar"
+        required: false
+        default: "https://claude.ai/"
+        type: string
+      origin:
+        description: "Origen exacto (filtro de REA)"
+        required: false
+        default: "https://claude.ai"
+        type: string
+
+jobs:
+  analizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: procps (REA lo exige para arrancar)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends procps
+
+      - name: Instalar REA
+        run: npm install -g rea-agents@6.5.0 --no-audit --no-fund
+
+      - name: Localizar Chrome real (JA3 auténtico, no el de Playwright)
+        run: |
+          set -uo pipefail
+          for c in google-chrome google-chrome-stable chromium chromium-browser; do
+            if command -v "$c" >/dev/null 2>&1; then
+              echo "CHROME_BIN=$(command -v $c)" >> "$GITHUB_ENV"
+              echo "· Chrome: $(command -v $c) — $( "$c" --version 2>/dev/null | head -1)"
+              break
+            fi
+          done
+          if [ -z "${CHROME_BIN:-}" ]; then
+            echo "::error::no hay Chrome en el runner"
+            exit 1
+          fi
+
+      - name: Lanzar Chrome con CDP + netlog (registro de red)
+        # El netlog captura TODO lo que se descarga: así medimos los bytes
+        # reales (disciplina de datos) y listamos los endpoints que se llaman.
+        # --blink-settings=imagesEnabled=false -> no baja imágenes (datos).
+        run: |
+          set -uo pipefail
+          "$CHROME_BIN" \
+            --headless=new \
+            --remote-debugging-port=9222 \
+            --user-data-dir="$RUNNER_TEMP/chrome-profile" \
+            --no-sandbox --disable-dev-shm-usage --disable-gpu \
+            --blink-settings=imagesEnabled=false \
+            --disable-blink-features=AutomationControlled \
+            --window-size=1280,900 \
+            --user-agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36" \
+            --log-net-log="$RUNNER_TEMP/netlog.json" \
+            --net-log-capture-mode=Default \
+            about:blank > "$RUNNER_TEMP/chrome.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/chrome.pid"
+          for i in $(seq 1 40); do
+            if curl -sf http://127.0.0.1:9222/json/version >/dev/null 2>&1; then
+              echo "· CDP listo"; break
+            fi
+            sleep 0.5
+          done
+          curl -s http://127.0.0.1:9222/json/version | jq -r '"Browser: " + .Browser' || true
+
+      - name: Abrir la página objetivo
+        run: |
+          set -uo pipefail
+          curl -s -X PUT "http://127.0.0.1:9222/json/new?${{ inputs.url }}" > "$RUNNER_TEMP/newtab.json" || true
+          echo "· tab creado:"; cat "$RUNNER_TEMP/newtab.json" | jq -r '.id // .type // "?"' 2>/dev/null || true
+          sleep 8   # deja que la app hydrate y pida sus chunks
+
+      - name: Listar targets CDP
+        id: targets
+        run: |
+          set -uo pipefail
+          rea list-browser-targets http://127.0.0.1:9222 --format json > "$RUNNER_TEMP/targets.json" 2>&1 || true
+          head -c 4000 "$RUNNER_TEMP/targets.json"; echo
+          TARGET=$(jq -r '[.. | objects | to_entries[]? | select(.key | test("target_?[Ii]d")) | .value] | map(select(type=="string")) | .[0] // empty' "$RUNNER_TEMP/targets.json" 2>/dev/null)
+          echo "TARGET_ID=$TARGET" >> "$GITHUB_ENV"
+          echo "· TARGET_ID=$TARGET"
+
+      - name: REA · analizar el bundle web (chunk graph + endpoints)
+        run: |
+          set -uo pipefail
+          if [ -z "${TARGET_ID:-}" ]; then echo "::error::sin TARGET_ID"; exit 1; fi
+          rea analyze-web-bundle http://127.0.0.1:9222 "$TARGET_ID" \
+            --allowed-origins "${{ inputs.origin }}" \
+            --observation-ms 3000 \
+            --format json > "$RUNNER_TEMP/bundle.json" 2> "$RUNNER_TEMP/bundle.err" || true
+          echo "· bundle.json: $(wc -c < "$RUNNER_TEMP/bundle.json") bytes"
+          head -c 1500 "$RUNNER_TEMP/bundle.err" || true
+          echo "· claves de nivel superior:"; jq -r 'keys_unsorted? // keys' "$RUNNER_TEMP/bundle.json" 2>/dev/null || echo "(json no valido)"
+
+      - name: REA · descubrir herramientas WebMCP declaradas por la pagina
+        run: |
+          set -uo pipefail
+          if [ -n "${TARGET_ID:-}" ]; then
+            rea discover-webmcp-tools http://127.0.0.1:9222 "$TARGET_ID" \
+              --allowed-origins "${{ inputs.origin }}" --format json \
+              > "$RUNNER_TEMP/webmcp.json" 2> "$RUNNER_TEMP/webmcp.err" || true
+            echo "· webmcp.json: $(wc -c < "$RUNNER_TEMP/webmcp.json") bytes"
+            head -c 2500 "$RUNNER_TEMP/webmcp.json" || true
+          fi
+
+      - name: Extraer endpoints del netlog (SOLO url/metodo/status/bytes)
+        # ⚠️ Nunca se extraen cabeceras, cookies ni cuerpos: solo la URL,
+        #    el método, el código de estado y el tamaño de la transfer.
+        run: |
+          set -uo pipefail
+          jq -r '
+            [ .events[]
+              | select(.type=="URL_REQUEST_JOB_FILTERED" or .type=="URL_REQUEST_JOB")
+              | .params as $p
+              | { url: $p.url, method: ($p.method // "?"), id: $p.request_id } ] as $reqs
+            | [ .events[]
+              | select(.type=="URL_REQUEST_JOB_BYTES_READ" or .type=="URL_REQUEST_JOB_BYTES_SENT")
+              | { id: .params.request_id, bytes: (.params.byte_count // 0) } ]
+            | reduce .[] as $b ({}; .[$b.id] = (.[$b.id] // 0) + ($b.bytes // 0))
+            | . as $bytes
+            | $reqs
+            | unique_by(.id)
+            | map({ url, method, bytes: ($bytes[.id] // 0) })
+            | sort_by(.url)
+          ' "$RUNNER_TEMP/netlog.json" > "$RUNNER_TEMP/endpoints.json" 2>/dev/null || echo "[]" > "$RUNNER_TEMP/endpoints.json"
+
+          echo "· endpoints distintos: $(jq 'length' "$RUNNER_TEMP/endpoints.json")"
+          echo "· bytes totales transferidos: $(jq '[.[].bytes]|add // 0' "$RUNNER_TEMP/endpoints.json")"
+          echo
+          echo "── endpoints con /api, /mcp, connector, oauth, anthropic ──"
+          jq -r '.[] | select(.url|test("api|mcp|connector|oauth|anthropic|graphql";"i")) | "\(.method)\t\(.bytes)\t\(.url)"' "$RUNNER_TEMP/endpoints.json" | head -80
+          echo
+          echo "── TODO el traffic (url + bytes) ──"
+          jq -r '.[] | "\(.bytes)\t\(.method)\t\(.url)"' "$RUNNER_TEMP/endpoints.json" | head -120
+
+      - name: Medir el peso del bundle (disciplina de datos)
+        run: |
+          set -uo pipefail
+          BYTES=$(jq '[.[].bytes]|add // 0' "$RUNNER_TEMP/endpoints.json")
+          echo "::notice::BYTES_TOTALES=$BYTES"
+          echo "bytes_json=$(wc -c < "$RUNNER_TEMP/endpoints.json")" >> "$GITHUB_OUTPUT"
+
+      - name: Subir la evidencia (KB, no MB)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rea-connectors-evidencia
+          path: |
+            ${{ runner.temp }}/endpoints.json
+            ${{ runner.temp }}/webmcp.json
+            ${{ runner.temp }}/targets.json
+          retention-days: 30
+
+      - name: Subir el bundle crudo (solo si es razonable)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rea-connectors-bundle-crudo
+          path: ${{ runner.temp }}/bundle.json
+          retention-days: 30
