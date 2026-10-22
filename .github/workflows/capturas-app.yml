@@ -1,0 +1,186 @@
+name: Capturas reales (app corriendo)
+
+# Abre apps de verdad bajo Xvfb y guarda FOTOGRAMAS reales:
+#   1) draw.io Desktop 32.4.1 con el diagrama de la auditoría
+#   2) Ghidra 12.1.4 con el binario nativo auditado (CodeBrowser)
+# Todo corre en el runner: 0 MB de datos del móvil.
+# No publica nada. Solo produce un artefacto con PNG + logs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      asset_url:
+        description: 'URL del .deb a abrir'
+        required: false
+        default: 'https://github.com/jgraph/drawio-desktop/releases/download/v32.4.1/drawio-amd64-32.4.1.deb'
+      asset_sha256:
+        description: 'sha256 esperado del .deb'
+        required: false
+        default: 'f4455b3bba3d3b539c3cd069218fc64f0462b1b01610fe8d11acc3ca8566f32b'
+      binario:
+        description: 'Ruta DENTRO del .deb que se abre en Ghidra'
+        required: false
+        default: 'opt/drawio/chrome_crashpad_handler'
+      sha_binario:
+        description: 'sha256 esperado de ese binario (evidencia nativa)'
+        required: false
+        default: '3e9742b8edaef6779c48e0966b9f433db39e59ee148854312b5a5c8612100a04'
+
+permissions:
+  contents: read
+
+jobs:
+  capturas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Cachear Ghidra
+        uses: actions/cache@v4
+        with:
+          path: ~/ghidra
+          key: ghidra-12.1.4-ddac49f9
+
+      - name: Instalar Ghidra 12.1.4
+        run: |
+          set -euo pipefail
+          if [ ! -d "$HOME/ghidra" ]; then
+            curl -fsSL -o "$RUNNER_TEMP/ghidra.zip" \
+              "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip"
+            echo "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db  $RUNNER_TEMP/ghidra.zip" \
+              | sha256sum -c -
+            unzip -q "$RUNNER_TEMP/ghidra.zip" -d "$HOME"
+            mv "$HOME"/ghidra_12.1.4_PUBLIC "$HOME/ghidra"
+            rm -f "$RUNNER_TEMP/ghidra.zip"
+          fi
+
+      - name: Herramientas de pantalla
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/capturas
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            xvfb xdotool imagemagick x11-utils fonts-dejavu fonts-liberation
+          # librerías de runtime que necesita Electron (nombres válidos en 22.04 y 24.04)
+          for p in libgtk-3-0t64 libgtk-3-0 libnss3 libasound2t64 libasound2 libgbm1 \
+                   libxss1 libxtst6 libnotify4 libatspi2.0-0t64 libatspi2.0-0 xdg-utils libdrm2; do
+            sudo apt-get install -y -qq --no-install-recommends "$p" >/dev/null 2>&1 \
+              && echo "ok  $p" || echo "--  $p (no existe en este Ubuntu)"
+          done | tee /tmp/capturas/deps.txt
+
+      - name: Descargar y verificar el .deb (mismo artefacto del informe)
+        env:
+          ASSET_URL: ${{ inputs.asset_url }}
+          ASSET_SHA256: ${{ inputs.asset_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/app" "$RUNNER_TEMP/extraido" /tmp/capturas
+          curl -fSL --retry 3 -A "rea-capturas" -o "$RUNNER_TEMP/app/drawio.deb" "$ASSET_URL"
+          ls -la "$RUNNER_TEMP/app/drawio.deb"
+          echo "$ASSET_SHA256  $RUNNER_TEMP/app/drawio.deb" | sha256sum -c -
+          sha256sum "$RUNNER_TEMP/app/drawio.deb" | tee /tmp/capturas/sha-deb.txt
+
+      - name: Instalar draw.io Desktop (tolerante)
+        run: |
+          set -uo pipefail
+          mkdir -p /tmp/capturas
+          sudo apt-get install -y -qq "$RUNNER_TEMP/app/drawio.deb" > /tmp/capturas/apt-drawio.log 2>&1 \
+            || echo "AVISO: apt no resolvió las dependencias; se usará el árbol extraído"
+          ls -la /opt/drawio 2>/dev/null | head -10 | tee /tmp/capturas/drawio-ficheros.txt || true
+          if [ -x /opt/drawio/drawio ]; then
+            echo "DRAWIO_BIN=/opt/drawio/drawio" >> "$GITHUB_ENV"
+            echo "RESULTADO: instalado en /opt/drawio"
+          else
+            echo "DRAWIO_BIN=$RUNNER_TEMP/extraido/opt/drawio/drawio" >> "$GITHUB_ENV"
+            echo "RESULTADO: sin instalar; se usará el árbol extraído"
+          fi
+
+      - name: Extraer el binario nativo auditado
+        env:
+          BINARIO: ${{ inputs.binario }}
+          SHA_BINARIO: ${{ inputs.sha_binario }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/extraido"
+          ar x "$RUNNER_TEMP/app/drawio.deb"
+          for d in data.tar.*; do [ -e "$d" ] && tar -xf "$d" && rm -f "$d"; done
+          B="$RUNNER_TEMP/extraido/$BINARIO"
+          test -f "$B"
+          file "$B" | tee /tmp/capturas/binario-file.txt
+          echo "$SHA_BINARIO  $B" | sha256sum -c - | tee /tmp/capturas/binario-sha.txt
+
+      - name: Pantalla virtual (1600x1000x24)
+        run: |
+          set -euo pipefail
+          Xvfb :99 -screen 0 1600x1000x24 -ac -nolisten tcp > /tmp/capturas/xvfb.log 2>&1 &
+          sleep 3
+          DISPLAY=:99 xdpyinfo | head -6 | tee /tmp/capturas/xdpyinfo.txt
+
+      - name: Captura 1 · draw.io Desktop abierto
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          export DISPLAY=:99
+          cp "$GITHUB_WORKSPACE/docs/capturas/auditoria.drawio" /tmp/auditoria.drawio
+          ls -la /tmp/auditoria.drawio
+          echo "binario: $DRAWIO_BIN"
+          "$DRAWIO_BIN" --no-sandbox --disable-gpu --disable-dev-shm-usage \
+            /tmp/auditoria.drawio > /tmp/capturas/drawio.log 2>&1 &
+          DPID=$!
+          for t in 20 40 60; do
+            sleep 20
+            echo "--- ventanas a los ${t}s ---"
+            xdotool search --name "" getwindowname %@ 2>/dev/null | head -20 | tee "/tmp/capturas/windows-drawio-$t.txt" || true
+            import -display :99 -window root "/tmp/capturas/01-drawio-$t.png" || true
+          done
+          kill "$DPID" 2>/dev/null || true
+          pkill -x drawio 2>/dev/null || true
+          ls -la /tmp/capturas/*.png
+
+      - name: Proyecto Ghidra con el binario auditado (headless)
+        env:
+          BINARIO: ${{ inputs.binario }}
+        run: |
+          set -uo pipefail
+          B="$RUNNER_TEMP/extraido/$BINARIO"
+          "$HOME/ghidra/support/analyzeHeadless" /tmp/proj rea -import "$B" -max-cpu 2 \
+            > /tmp/capturas/ghidra-headless.log 2>&1 || tail -40 /tmp/capturas/ghidra-headless.log
+          ls -la /tmp/proj | tee /tmp/capturas/ghidra-proyecto.txt
+
+      - name: Captura 2 · Ghidra CodeBrowser abierto
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          export DISPLAY=:99
+          "$HOME/ghidra/ghidraRun" /tmp/proj/rea.gpr:/chrome_crashpad_handler \
+            > /tmp/capturas/ghidra-gui.log 2>&1 &
+          GPID=$!
+          for t in 60 90 120 150; do
+            sleep 30
+            # cerrar diálogos de primer arranque (acuerdo de usuario / tip del día) si aparecen
+            for W in $(xdotool search --name "User Agreement" 2>/dev/null || true); do
+              xdotool windowactivate "$W" 2>/dev/null || true
+              xdotool key --window "$W" Return 2>/dev/null || true
+            done
+            echo "--- ventanas a los ${t}s ---"
+            xdotool search --name "" getwindowname %@ 2>/dev/null | head -25 | tee "/tmp/capturas/windows-ghidra-$t.txt" || true
+            import -display :99 -window root "/tmp/capturas/02-ghidra-$t.png" || true
+          done
+          kill "$GPID" 2>/dev/null || true
+          ls -la /tmp/capturas/*.png
+
+      - name: Subir capturas
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capturas-app
+          path: /tmp/capturas/**
+          retention-days: 7
+          if-no-files-found: warn
