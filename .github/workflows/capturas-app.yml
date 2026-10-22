@@ -169,23 +169,27 @@ jobs:
           "$HOME/ghidra/ghidraRun" /tmp/proj/rea.gpr:/chrome_crashpad_handler \
             > /tmp/capturas/ghidra-gui.log 2>&1 &
           GPID=$!
-          for t in 60 90 120 150; do
-            sleep 30
-            # cerrar diálogos de primer arranque (acuerdo de usuario / tip del día) si aparecen
-            for W in $(xdotool search --name "User Agreement" 2>/dev/null || true); do
-              xdotool windowactivate "$W" 2>/dev/null || true
-              xdotool key --window "$W" Return 2>/dev/null || true
-            done
-            echo "--- ventanas a los ${t}s ---"
-            xdotool search --name "" getwindowname %@ 2>/dev/null | head -25 | tee "/tmp/capturas/windows-ghidra-$t.txt" || true
+          READY=0
+          for i in $(seq 1 24); do
+            sleep 10
+            if xdotool search --name "CodeBrowser" 2>/dev/null | head -1 | grep -q .; then
+              echo "CodeBrowser listo a los $((i*10)) s"; READY=1; break
+            fi
+            # primer arranque: acuerdo de usuario (botón "I Agree", centrado en 1600x1000)
+            xdotool mousemove 737 733 click 1 2>/dev/null || true
+            xdotool key Return 2>/dev/null || true
+          done
+          echo "READY=$READY"
+          xdotool search --name "" getwindowname %@ 2>/dev/null | head -25 | tee /tmp/capturas/windows-ghidra.txt || true
+          for t in 1 2; do
             W=$(xdotool search --name "CodeBrowser" 2>/dev/null | tail -1 || true)
             if [ -n "${W:-}" ]; then
               xdotool windowsize "$W" 1600 1000 2>/dev/null || true
               xdotool windowmove "$W" 0 0 2>/dev/null || true
-              sleep 4
-              import -display :99 -window "$W" "/tmp/capturas/02-ghidra-ventana-$t.png" || true
             fi
-            import -display :99 -window root "/tmp/capturas/02-ghidra-$t.png" || true
+            sleep 20
+            [ -n "${W:-}" ] && import -display :99 -window "$W" "/tmp/capturas/02-ghidra-ventana-$t.png" || true
+            import -display :99 -window root "/tmp/capturas/02-ghidra-root-$t.png" || true
           done
           kill "$GPID" 2>/dev/null || true
           ls -la /tmp/capturas/*.png
