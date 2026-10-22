@@ -137,7 +137,13 @@ jobs:
           for t in 20 40 60; do
             sleep 20
             echo "--- ventanas a los ${t}s ---"
-            xdotool search --name "" getwindowname %@ 2>/dev/null | head -20 | tee "/tmp/capturas/windows-drawio-$t.txt" || true
+            W=$(xdotool search --name "draw.io" 2>/dev/null | tail -1 || true)
+            if [ -n "${W:-}" ]; then
+              xdotool windowsize "$W" 1600 1000 2>/dev/null || true
+              xdotool windowmove "$W" 0 0 2>/dev/null || true
+              sleep 3
+              import -display :99 -window "$W" "/tmp/capturas/01-drawio-ventana-$t.png" || true
+            fi
             import -display :99 -window root "/tmp/capturas/01-drawio-$t.png" || true
           done
           kill "$DPID" 2>/dev/null || true
@@ -150,6 +156,7 @@ jobs:
         run: |
           set -uo pipefail
           B="$RUNNER_TEMP/extraido/$BINARIO"
+          mkdir -p /tmp/proj
           "$HOME/ghidra/support/analyzeHeadless" /tmp/proj rea -import "$B" -max-cpu 2 \
             > /tmp/capturas/ghidra-headless.log 2>&1 || tail -40 /tmp/capturas/ghidra-headless.log
           ls -la /tmp/proj | tee /tmp/capturas/ghidra-proyecto.txt
@@ -171,6 +178,13 @@ jobs:
             done
             echo "--- ventanas a los ${t}s ---"
             xdotool search --name "" getwindowname %@ 2>/dev/null | head -25 | tee "/tmp/capturas/windows-ghidra-$t.txt" || true
+            W=$(xdotool search --name "CodeBrowser" 2>/dev/null | tail -1 || true)
+            if [ -n "${W:-}" ]; then
+              xdotool windowsize "$W" 1600 1000 2>/dev/null || true
+              xdotool windowmove "$W" 0 0 2>/dev/null || true
+              sleep 4
+              import -display :99 -window "$W" "/tmp/capturas/02-ghidra-ventana-$t.png" || true
+            fi
             import -display :99 -window root "/tmp/capturas/02-ghidra-$t.png" || true
           done
           kill "$GPID" 2>/dev/null || true
