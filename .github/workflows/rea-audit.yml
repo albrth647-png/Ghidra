@@ -373,6 +373,60 @@ jobs:
           PY
 
       # ---------------------------------------------------------------
+      # 8b. Muestras verificables (KB): los bytes crudos que se citan,
+      #     sin abrir el JSON de cientos de MB.
+      # ---------------------------------------------------------------
+      - name: Muestras verificables (KB)
+        if: always()
+        run: |
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/muestras.txt"
+          : > "$OUT"
+          echo "# muestras verificables" >> "$OUT"
+          echo "app    : ${{ inputs.app_nombre }}" >> "$OUT"
+          echo "asset  : ${{ inputs.asset_url }}" >> "$OUT"
+          echo "fecha  : $(date -u +%FT%TZ)" >> "$OUT"
+          echo >> "$OUT"
+          echo "## sha256 del asset descargado" >> "$OUT"
+          cat "$RUNNER_TEMP/app/asset.sha256" >> "$OUT" 2>/dev/null || echo "(sin hash)" >> "$OUT"
+          echo >> "$OUT"
+
+          ASARX="$RUNNER_TEMP/asar_x"
+          if [ ! -d "$ASARX" ]; then
+            echo "(sin asar extraido)" >> "$OUT"
+            wc -c "$OUT"; exit 0
+          fi
+
+          echo "## sha256 de los JS mas grandes del asar" >> "$OUT"
+          find "$ASARX" -maxdepth 4 -name "*.js" -type f -size +100k 2>/dev/null | head -6 | while read -r f; do
+            printf "%s  %s\n" "$(sha256sum "$f" | cut -d' ' -f1)" "${f#$ASARX/}" >> "$OUT"
+          done
+          echo >> "$OUT"
+
+          MAIN="$ASARX/dist/main.js"
+          if [ -f "$MAIN" ]; then
+            echo "## contexto crudo alrededor de sandbox / preload (bytes del bundle)" >> "$OUT"
+            grep -oE '.{0,180}sandbox:.{0,140}' "$MAIN" 2>/dev/null | head -3 >> "$OUT" || true
+            echo >> "$OUT"
+            echo "## canales literales en llamadas handle(\"...\")" >> "$OUT"
+            grep -oE 'handle\(\s*"[^"]{2,60}"' "$MAIN" 2>/dev/null | sed -E 's/.*"(.*)"/\1/' | sort -u | head -80 >> "$OUT" || true
+            echo >> "$OUT"
+            echo "## hosts https con su conteo (cadenas del bundle, no peticiones)" >> "$OUT"
+            grep -oE 'https://[a-zA-Z0-9._-]+' "$MAIN" 2>/dev/null | sort | uniq -c | sort -rn | head -25 >> "$OUT" || true
+          fi
+          echo >> "$OUT"
+          wc -c "$OUT"
+
+      - name: Subir muestras (KB)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rea-muestras-${{ inputs.app_nombre }}
+          path: ${{ runner.temp }}/muestras.txt
+          retention-days: 14
+          if-no-files-found: warn
+
+      # ---------------------------------------------------------------
       # 9. Subir evidencia (siempre, aunque algo falle)
       # ---------------------------------------------------------------
       - name: Subir evidencia
