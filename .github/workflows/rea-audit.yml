@@ -37,6 +37,16 @@ on:
         required: false
         default: "false"
         type: string
+      rea_max_heap_mb:
+        description: "Heap máximo por fichero JS (MiB). 1024 se agota con bundles minificados; el runner tiene 16 GB"
+        required: false
+        default: "6144"
+        type: string
+      rea_timeout_ms:
+        description: "Timeout por fichero JS (ms)"
+        required: false
+        default: "900000"
+        type: string
 
 jobs:
   auditar:
@@ -227,6 +237,9 @@ jobs:
       # 6. Análisis JS/Electron  ← ESTA ES LA OFERTA DE 150 USDT
       # ---------------------------------------------------------------
       - name: Análisis JS/Electron con REA
+        env:
+          REA_MAX_HEAP_MB: ${{ inputs.rea_max_heap_mb }}
+          REA_TIMEOUT_MS: ${{ inputs.rea_timeout_ms }}
         run: |
           set -euo pipefail
           # elegir objetivo: override (proceso main) > asar > dir con package.json > raíz
@@ -246,7 +259,12 @@ jobs:
             TARGET="$RUNNER_TEMP/jsdir/$(basename "$TARGET")"
           fi
 
+          # Heap: el default (1 GiB) se agota con bundles minificados grandes
+          # (Beekeeper 6.1.6: main.js, renderer/assets/index-*.js y utility.js).
+          # El runner tiene 16 GB, así que 6 GiB es seguro. Configurable por input.
           rea analyze-javascript-application "$TARGET" --json \
+            --max-heap-mb "${REA_MAX_HEAP_MB:-6144}" \
+            --analysis-timeout-ms "${REA_TIMEOUT_MS:-900000}" \
             > "$RUNNER_TEMP/evidencia-js.json" || echo "js_exit=$?" >> "$GITHUB_ENV"
 
           echo "--- tamaño evidencia JS ---"
@@ -299,6 +317,8 @@ jobs:
       # 8. Resumen unificado
       # ---------------------------------------------------------------
       - name: Resumen de la auditoría
+        env:
+          APP: ${{ inputs.app_nombre }}
         run: |
           python3 - <<'PY'
           import json, os, pathlib
@@ -310,12 +330,20 @@ jobs:
                   out["archivos"][nombre] = "ausente"; continue
               try:
                   d = json.loads(p.read_text())
+                  norm = d.get("normalized_result") or {}
+                  sem = norm.get("semantic_graph") or {}
+                  cov = sem.get("coverage") or {}
+                  lims = d.get("limitations", [])
                   out["archivos"][nombre] = {
                       "evidence_id": d.get("evidence_id"),
                       "operation": d.get("operation"),
                       "confidence": d.get("confidence"),
-                      "limitaciones": len(d.get("limitations",[])),
+                      "limitaciones": len(lims),
                       "bytes": p.stat().st_size,
+                      "cobertura": cov.get("status"),
+                      "truncado": cov.get("truncated"),
+                      "recursos_agotados": [l.split(":")[0] for l in lims if "Resource constraint" in l],
+                      "resumen": norm.get("summary"),
                   }
               except Exception as e:
                   out["archivos"][nombre] = f"error: {e}"
