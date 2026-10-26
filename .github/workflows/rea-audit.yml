@@ -274,8 +274,10 @@ jobs:
           fi
           echo "objetivo JS: $TARGET"
           if [ -f "$TARGET" ]; then
+            # REA solo acepta un directorio o un .asar. Para analizar UN fichero
+            # (bundle minificado grande) se apunta al directorio que lo contiene.
             mkdir -p "$RUNNER_TEMP/jsdir" && cp "$TARGET" "$RUNNER_TEMP/jsdir/"
-            TARGET="$RUNNER_TEMP/jsdir/$(basename "$TARGET")"
+            TARGET="$RUNNER_TEMP/jsdir"
           fi
 
           # Heap: el default (1 GiB) se agota con bundles minificados grandes
