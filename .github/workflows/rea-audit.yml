@@ -379,7 +379,7 @@ jobs:
       - name: Muestras verificables (KB)
         if: always()
         run: |
-          set -uo pipefail
+          set -u
           OUT="$RUNNER_TEMP/muestras.txt"
           : > "$OUT"
           echo "# muestras verificables" >> "$OUT"
@@ -394,19 +394,39 @@ jobs:
           ASARX="$RUNNER_TEMP/asar_x"
           if [ ! -d "$ASARX" ]; then
             echo "(sin asar extraido)" >> "$OUT"
-            wc -c "$OUT"; exit 0
+            wc -c "$OUT" || true
+            exit 0
           fi
 
+          # La lista va a fichero: `find | head` con bash -e y pipefail mata el paso por SIGPIPE.
+          LIST="$RUNNER_TEMP/jslist.txt"
+          find "$ASARX" -maxdepth 5 -name "*.js" -type f -size +100k > "$LIST" 2>/dev/null || true
           echo "## sha256 de los JS mas grandes del asar" >> "$OUT"
-          find "$ASARX" -maxdepth 4 -name "*.js" -type f -size +100k 2>/dev/null | head -6 | while read -r f; do
+          head -6 "$LIST" 2>/dev/null | while read -r f; do
             printf "%s  %s\n" "$(sha256sum "$f" | cut -d' ' -f1)" "${f#$ASARX/}" >> "$OUT"
-          done
+          done || true
           echo >> "$OUT"
 
-          MAIN="$ASARX/dist/main.js"
-          if [ -f "$MAIN" ]; then
-            echo "## contexto crudo alrededor de sandbox / preload (bytes del bundle)" >> "$OUT"
-            grep -oE '.{0,180}sandbox:.{0,140}' "$MAIN" 2>/dev/null | head -3 >> "$OUT" || true
+          # main: campo main del package.json; si no, el mayor dist/main*.js; si no, el mayor de dist/
+          MAIN=""
+          MP=$(jq -r '.main // empty' "$ASARX/package.json" 2>/dev/null || true)
+          if [ -n "$MP" ] && [ -f "$ASARX/${MP#./}" ]; then
+            MAIN="$ASARX/${MP#./}"
+          else
+            MAIN=$(grep -m1 -E '/dist/main[^/]*\.js$' "$LIST" 2>/dev/null || true)
+          fi
+          if [ -z "$MAIN" ]; then
+            MAIN=$(grep -m1 -E '/dist/.*\.js$' "$LIST" 2>/dev/null || true)
+          fi
+          echo "main usado: ${MAIN:-ninguno}" >> "$OUT"
+          echo >> "$OUT"
+
+          if [ -n "$MAIN" ] && [ -f "$MAIN" ]; then
+            echo "## contexto crudo alrededor de sandbox (bytes del bundle)" >> "$OUT"
+            grep -oE '.{0,200}sandbox:.{0,160}' "$MAIN" 2>/dev/null | head -3 >> "$OUT" || true
+            echo >> "$OUT"
+            echo "## contexto crudo alrededor de preload" >> "$OUT"
+            grep -oE '.{0,80}preload:.{0,120}' "$MAIN" 2>/dev/null | head -3 >> "$OUT" || true
             echo >> "$OUT"
             echo "## canales literales en llamadas handle(\"...\")" >> "$OUT"
             grep -oE 'handle\(\s*"[^"]{2,60}"' "$MAIN" 2>/dev/null | sed -E 's/.*"(.*)"/\1/' | sort -u | head -80 >> "$OUT" || true
@@ -415,7 +435,7 @@ jobs:
             grep -oE 'https://[a-zA-Z0-9._-]+' "$MAIN" 2>/dev/null | sort | uniq -c | sort -rn | head -25 >> "$OUT" || true
           fi
           echo >> "$OUT"
-          wc -c "$OUT"
+          wc -c "$OUT" || true
 
       - name: Subir muestras (KB)
         if: always()
