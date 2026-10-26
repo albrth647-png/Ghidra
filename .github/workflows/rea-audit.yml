@@ -47,6 +47,11 @@ on:
         required: false
         default: "900000"
         type: string
+      js_target_rel:
+        description: "Ruta concreta dentro del asar (ej: dist/main.js). Vacío = dir del entrypoint main"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   auditar:
@@ -184,6 +189,8 @@ jobs:
       # 5b. Extraer asar → package.json (deps con versión) + SBOM + main
       # ---------------------------------------------------------------
       - name: Extraer asar (SBOM + proceso main)
+        env:
+          JS_TARGET_REL: ${{ inputs.js_target_rel }}
         run: |
           set -uo pipefail
           ASAR=$(find "$RUNNER_TEMP/extraido" -name "*.asar" 2>/dev/null | head -1)
@@ -230,6 +237,18 @@ jobs:
             else
               echo "No se resolvió el main (se usará el asar completo o el descubrimiento)."
               jq -r '.main // "SIN CAMPO main"' "$RUNNER_TEMP/asar_x/package.json" 2>/dev/null || true
+            fi
+          fi
+
+          # --- override explícito: un fichero o subruta concreta dentro del asar ---
+          # (un bundle minificado grande agota el heap/tiempo si se analiza el dir entero)
+          if [ -n "${JS_TARGET_REL:-}" ]; then
+            CAND="$RUNNER_TEMP/asar_x/$JS_TARGET_REL"
+            if [ -f "$CAND" ] || [ -d "$CAND" ]; then
+              echo "js_target_override=$CAND" >> "$GITHUB_ENV"
+              echo "objetivo JS por input: $JS_TARGET_REL"
+            else
+              echo "AVISO: js_target_rel no existe en el asar: $JS_TARGET_REL"
             fi
           fi
 
